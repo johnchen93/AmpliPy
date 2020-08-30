@@ -16,16 +16,16 @@ To use AmpliPy from the command line, simply run the ‘amplipy.py’ file using
   
 For example, these two commands are equivalent.
 ```
-amplipy.py    example_template.txt    example_primers.txt    -p    1    3
-amplipy.py    example_template.txt    example_primers.txt    -n    TEM1-fwd  B1
+python   amplipy.py   example_template.txt   example_primers.txt   -p   1   3
+python   amplipy.py   example_template.txt   example_primers.txt   -n   TEM1-fwd  B1
 ```
 By default, the template DNA is treated as linear. To specify a circular template, use the ‘-c’ option.  
 ```
-amplipy.py     example_template.txt     example_primers.txt    -p   1    3    -c
+python   amplipy.py   example_template.txt   example_primers.txt   -p   1   3   -c
 ```
 To send the output to a file instead of the command line, specify a file with the ‘-o’ option.
 ```
-amplipy.py     example_template.txt     example_primers.txt    -p   1    3    -c   -o test_result.txt
+python   amplipy.py   example_template.txt   example_primers.txt   -p   1   3   -c   -o test_result.txt
 ```
 ## Running from another Python script
 To conduct the analysis from another script, import the ‘MakePrimer’ and ‘PCR’ functions from AmpliPy. See ‘import_example.py’ for a full example.  
