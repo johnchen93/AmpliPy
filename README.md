@@ -4,6 +4,8 @@ by John Chen
 AmpliPy is a Python implementation of the primer binding and PCR analysis methods of Amplify 4 (https://github.com/wrengels/Amplify4). Given one or more primers and a DNA template, the program conducts a search for possible binding sites for each primer to the template, then tests the binding sites for formation of amplicons. AmpliPy does not implement the primer Tm or dimerization calculations features from Amplify 4.  
   
 The calculation of primer binding follows the primability and stability measures stated in the Amplify 4 help menu. AmpliPy’s calculations tend to be a bit higher than Amplify 4’s numbers, possibly due to differences in rounding between the two methods.  
+  
+A PDF version of this README is available [here](./Amplipy.pdf).  
 # Usage  
 ## Installation  
 AmpliPy requires an installation of Python 3.6 or higher. No other installation steps are required.  
