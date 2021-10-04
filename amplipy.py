@@ -1,7 +1,9 @@
 #!python3
 import argparse
+from os import truncate
 import sys
-
+from dataclasses import dataclass
+from typing import Dict, Tuple, List
 # Python implementation of the PCR feature of Amplify 4
 
 # ---- Define some basic helper methods ----
@@ -13,6 +15,9 @@ def RevComp(seq):
     
 def Comp(seq):
     return seq.translate(dna_comp)
+
+def Rev(seq):
+    return seq[::-1]
     
 def clip(value, lower, upper):
     return lower if value < lower else upper if value > upper else value
@@ -56,402 +61,472 @@ primability_cutoff = 0.8 # fraction of max primability needed to confirm a prime
 stability_cutoff = 0.4 # fraction of max stability needed to confirm a primer binding
 cutoff_sum = primability_cutoff+stability_cutoff
 
-max_effective_primer = 30 # max number of bases to consider for calculating primer stats
-    
-def MakePrimer(seq, label=''):
-    '''
-        Create a dictionary containing the primer sequence and some precomputed stats.
-        
-        Input:
-        seq - string. Primer sequence written in 5' to 3' direction from left to right.
-        
-        Output:
-        A dictionary representing the primer and contains various stats.
-    '''
-    seq = seq.upper()
-    Pr_max, St_max = MaxPrimerStats(seq)
-    return {'seq':seq, 'label':label,
-            'Pr_max':Pr_max, 'Pr_min':Pr_max*primability_cutoff, 
-            'St_max':St_max, 'St_min':St_max*stability_cutoff  }
-    
-def PrimerStats(primer, target):
-    '''
-        Calculates primer stats when comparing to a target.
-    
-        Inputs:
-        primer - string. Primer sequence. 5' to 3' direction from left to right.
-        target - string. Target DNA sequence to compare to. 5' to 3' direction from left to right.
-    '''
-    primer_length = len(primer)
-    binding_length = min( min(primer_length, len(target)), max_effective_primer )
-    
-    run=-1 # consecutive run of matching bases from the 3' end
-    run_scores = []
-    Pr_total, St_total = 0, 0# primability and stability stats
-    matches = []
-    for k in range(binding_length):
-        i = primer[-k-1] # A base in the primer.
-        j = target[-k-1] # A base in the target.
-        Sij = S[i][j] # base pairing score
-        if i==j:
-            matches.append(match_tick)
-        elif Sij>0:
-            matches.append(ambig_tick)
-        else:
-            matches.append(blank_tick)
-        
-        # calculate primability stats
-        Mk = M[min(k,Mlim)] # 3' primability weight
-        Pr_total += Mk*Sij
-        
-        # calculate stability stats
-        if Sij > 0:
-            run += 1
-            Rk = R[min(run,Rlim)] # get the run weights
-            run_scores.append(Sij)
-        else:
-            run = -1 # set up so that a match of 1 has an index of 0
-            for score in run_scores:
-                St_total += Rk*score
-            run_scores = [] # reset run scores
-        
-    # collect last round of stability scores if there are any
-    for score in run_scores:
-        St_total += Rk*score
-        
-    return Pr_total, St_total, ''.join(matches[::-1])
-    
-def MaxPrimerStats(primer):
-    '''
-        Calculates maximum stats for a primer sequence.
-        
-        Input:
-        seq - string. Primer sequence written in 5' to 3' direction from left to right.
-    '''
-    binding_length = len(primer)
-    
-    Rn = R[min( binding_length, Rlim)] # maximum weight for a run of bases possible for this primer 
-    
-    Pr_max_total, St_max_total = 0, 0
-    for k in range(binding_length): # iterate from 3' to 5'
-        i = primer[-k-1] # A base in the primer.
-        Smax = S[i][i] # pairing score of a perfect match
-        
-        # calculate primability stats
-        Mk = M[min(k,Mlim)] # 3' primability weight
-        Pr_max_total += Mk*Smax
-        
-        # calculate stability stats
-        St_max_total += Smax
-    St_max_total *= Rn
-    
-    return Pr_max_total, St_max_total
+max_effective_primer_length = 30 # max number of bases to consider for calculating primer stats, default is 30 in Amplify4 (may be out of date since I last checked)
 
-# ---- Primer binding analysis ---- 
+class Primer():
+    match_tick = '|'
+    blank_tick = ' '
+    ambig_tick = ':'
+    fwd_3p_tick = ' 3\''
+    rev_3p_tick = '3\' '
+    trunc_mark = '...'
 
-def Match(primer, target):
-    '''
-        Takes a primer object and compares it to the target. Returns whether the primer binds above the cut-off
-        and the primer binding stats.
-    
-        Inputs:
-        primer - dict. Primer object containing the sequence and certain stats.
-        target - string. Target DNA sequence to compare to. Index 0 should be the 3', reverse the sequence if needed.
-    '''
-    Pr, St, matches = PrimerStats(primer['seq'],target)
-    
-    primability = 0
-    stability = 0
-    quality = 0
-    passing = ( Pr >= primer['Pr_min'] ) and ( St >= primer['St_min'] )
-    if passing:
-        primability =  Pr / primer['Pr_max']
-        stability   =  St / primer['St_max']
-        quality = (primability + stability - cutoff_sum)/(2-cutoff_sum)
+    name : str
+    raw_seq : str
+    seq : str
+    bind_length : int
+    is_truncated : bool
+    max_primability : float
+    min_primability : float
+    max_stability : float
+    min_stability : float
+
+    def __init__(self, raw_seq: str, name : str="primer", bind_length : int=0):
+        self.raw_seq = raw_seq.strip().upper()
+        self.name = name
+        self.bind_length = bind_length if bind_length > 0 else min(len(raw_seq), max_effective_primer_length)
+
+        self.seq = raw_seq if len(raw_seq)<=self.bind_length else raw_seq[-self.bind_length:]
+        self.bind_length = len(self.seq)
+        self.is_truncated = self.seq != self.raw_seq
+
+        self.max_primability, self.max_stability = self.max_primer_stats(self.seq)
+        self.min_primability = self.max_primability * primability_cutoff
+        self.min_stability = self.max_stability * stability_cutoff
+
+    # primer analysis helper functions
+    def max_primer_stats(self, primer : str):
+        '''
+            Calculates maximum stats for a primer sequence.
+            
+            Input:
+            seq - string. Primer sequence written in 5' to 3' direction from left to right.
+        '''
+        binding_length = len(primer)
         
-    return passing, primability, stability, quality, matches
+        Rn = R[min( binding_length, Rlim)] # maximum weight for a run of bases possible for this primer 
+        
+        Pr_max_total, St_max_total = 0, 0
+        for k in range(binding_length): # iterate from 3' to 5'
+            i = primer[-k-1] # A base in the primer.
+            Smax = S[i][i] # pairing score of a perfect match
+            
+            # calculate primability stats
+            Mk = M[min(k,Mlim)] # 3' primability weight
+            Pr_max_total += Mk*Smax
+            
+            # calculate stability stats
+            St_max_total += Smax
+        St_max_total *= Rn
+        
+        return Pr_max_total, St_max_total
 
-# visualization related parameters    
-match_tick = '|'
-blank_tick = ' '
-ambig_tick = ':'
-fwd_3p_tick = ' 3\''
-rev_3p_tick = '3\' '
-context_full_length = 100
-def PrimerSearch(primer, template, circular=False, show_primer_binding=True, silent=False):
-    '''
-        Takes a primer object and uses it to search for possible binding positions in a DNA template in both forward and reverse
-        directions. Returns all binding sites above the threshold.
-    
-        Inputs:
-        primer - dict. Primer object containing the sequence and certain stats.
-        template - string. Target DNA sequence to compare to. Index 0 should be the 3', reverse the sequence if needed.
-    '''
-    template = template.upper()
-    primer_length = len(primer['seq'])
-    n = min(primer_length, max_effective_primer)
-    ct_wl = (context_full_length-n)//2 # context sequence padding on the left side
-    ct_wr = ct_wl + 100-(ct_wl*2+n) # context sequence padding on the right side
-    sites = len(template)
-    fwd = []
-    for nmer, k in Nmer(template, n, circular):
-        bind, pr, st, q, matches = Match(primer, nmer)
-        if bind:
-            # format binding sites for visualization
-            if circular:
-                if k<((n-1)+ct_wl):
-                    context = Comp(template[k-(n-1)-(ct_wl):]+template[:k+ct_wr])
-                elif (sites-1)-k<ct_wr: # pushing up against 3' end of template
-                    context = Comp(template[k-(n-1)-(ct_wl):]+template[:(sites-1)-k+ct_wr-1])
-                else:
-                    context = Comp(template[k-(n-1)-(ct_wl):k+ct_wr])
+    def test_primer_stats(self, target : str):
+        '''
+            Calculates primer stats when comparing to a target.
+        
+            Inputs:
+            primer - string. Primer sequence. 5' to 3' direction from left to right.
+            target - string. Target DNA sequence to compare to. 5' to 3' direction from left to right.
+        '''
+        binding_length = min(len(self.seq), len(target))
+        
+        run=-1 # consecutive run of matching bases from the 3' end
+        run_scores = []
+        Pr_total, St_total = 0, 0# primability and stability stats
+        matches = []
+        for k in range(binding_length):
+            i = self.seq[-k-1] # A base in the primer.
+            j = target[-k-1] # A base in the target.
+            if j == ' ': # blank space 
+                matches.append(self.blank_tick * (binding_length-k))
+                break
             else:
-                context = Comp(template[max(0,k-(n-1)-(ct_wl)):min(sites,k+ct_wr)])
-            context = context.rjust(min(sites-k,context_full_length-1))
-            p_bind = (primer['seq']+fwd_3p_tick).rjust(ct_wl+(n)+len(fwd_3p_tick))
-            matches = matches.rjust(ct_wl+(n))
-            binding_site = {'template':context,'primer':p_bind,'matches':matches}
-            
-            fwd.append({'id':len(fwd)+1, 'pos':k+1, 'primability':pr, 'stability':st, 'quality':q, 
-                        'binding':binding_site,'dir':'Fwd', 'primer':primer})
-    
-    template_rc = RevComp(template)
-    rev = []
-    offset = 1 if primer_length%2==0 else 0 # offset factor for visualizing the reverse direction, not really sure why the primer length (odd or even) affects it. Probably due to reverse complementing the sequence before displaying.
-    for nmer, k in Nmer(template_rc, n, circular):
-        bind, pr, st, q, matches = Match(primer, nmer)
-        if bind:
-            # format binding sites for visualization
-            if circular:
-                if k<((n-1)+ct_wl):
-                    context = RevComp(template_rc[k-(n-1)-ct_wl:]+template_rc[:k+ct_wr+offset])
-                elif (sites-1)-k<ct_wr: # pushing up against 5' end of template
-                    context = RevComp(template_rc[(sites-1)-(n-1)-(ct_wl)-((sites-1)-k)+offset:]+template_rc[:ct_wr-1+offset-((sites-1)-k)])
+                Sij = S[i][j] # base pairing score
+                if i==j:
+                    matches.append(self.match_tick)
+                elif Sij>0:
+                    matches.append(self.ambig_tick)
                 else:
-                    context = RevComp(template_rc[k-(n-1)-ct_wl:k+ct_wr+offset])
+                    matches.append(self.blank_tick)
+            
+            # calculate primability stats
+            Mk = M[min(k,Mlim)] # 3' primability weight
+            Pr_total += Mk*Sij
+            
+            # calculate stability stats
+            if Sij > 0:
+                run += 1
+                Rk = R[min(run,Rlim)] # get the run weights
+                run_scores.append(Sij)
             else:
-                context = RevComp(template_rc[max(0,k-(n-1)-ct_wl):min(sites,k+ct_wr+offset)])
-                if sites-k<context_full_length: # for the reverse, padding only occurs near the end of the sequence, otherwise no padding is needed
-                    context = context.rjust(max(sites-k,context_full_length-(1-offset)))
-                print(sites-k)
-            p_bind = (rev_3p_tick+primer['seq'][::-1]).rjust(ct_wl+(n))
-            matches = matches[::-1].rjust( min(ct_wl+(n),len(context)) )
-            binding_site = {'template':context,'primer':p_bind,'matches':matches}
+                run = -1 # set up so that a match of 1 has an index of 0
+                for score in run_scores:
+                    St_total += Rk*score
+                run_scores = [] # reset run scores
             
-            rev.append({'id':len(rev)+1,'pos':sites-k, 'primability':pr, 'stability':st, 'quality':q, 
-                        'binding':binding_site,'dir':'Rev', 'primer':primer})
-    
-    if not silent:
-        PrintHeader(f"Binding sites for \'{primer['label']}\'")
-        for site in fwd:
-            PrintPrimerSite(site, show_primer_binding=show_primer_binding)
-        for site in rev:
-            PrintPrimerSite(site, rev=True, show_primer_binding=show_primer_binding)
+        # collect last round of stability scores if there are any
+        for score in run_scores:
+            St_total += Rk*score
+            
+        return Pr_total, St_total, ''.join(matches[::-1])
+
+    def test_binding(self, target: str) -> 'BindingResult':
+        '''
+            Takes a primer object and compares it to the target. Returns whether the primer binds above the cut-off
+            and the primer binding stats.
         
-    return fwd, rev
-
-def PrintHeader(header):
-    header = header.rjust(len(header)+4)
-    print('')
-    print(''.join(['-' for x in range(len(header)+4)]) )
-    print(header)
-    print(''.join(['-' for x in range(len(header)+4)]) )
-    
-def PrintPrimerSite(site, rev=False, show_primer_binding=True):
-    
-    print('\n')
-    print(GetPrimerSiteAbbrev(site))
-    if show_primer_binding:
-        print('')
-        PrintBindingContext(site['binding'],rev)
-
-def GetPrimerSiteAbbrev(site):
-    return f"{site['dir']} {site['id']} : 3\' pos {site['pos']} - {site['primer']['label']} | primability {site['primability']:.2f} | stability {site['stability']:.2f} | quality {site['quality']:.2f}"
-    
-def PrintBindingContext(binding_site, rev=False):
-    if not rev:
-        print(binding_site['primer'])
-        print(binding_site['matches'])
-        print(binding_site['template'])
-    else:
-        print(binding_site['template'])
-        print(binding_site['matches'])
-        print(binding_site['primer'])
-    
-def Nmer(seq, n, circular=False):
-    sites = len(seq)
-    for k in range(sites): # the k is the position of the 3'
-        if k+1<n: # the 3' position is not far enough in to fit the whole nmer
+            Inputs:
+            primer - dict. Primer object containing the sequence and certain stats.
+            target - string. Target DNA sequence to compare to. Index 0 should be the 3', reverse the sequence if needed.
+        '''
+        Pr, St, matches = self.test_primer_stats(target)
+        
+        primability = 0
+        stability = 0
+        quality = 0
+        passing = ( Pr >= self.min_primability ) and ( St >= self.min_stability )
+        if passing:
+            primability =  Pr / self.max_primability
+            stability   =  St / self.max_stability
+            quality = (primability + stability - cutoff_sum)/(2-cutoff_sum)
             
-            # else: # just return a truncated sequence
-            nmer = seq[0:k+1]
-            if circular: # reach back and get some sequence from the back end
-                nmer = seq[k-(n-1):]+nmer
+        return BindingResult(self, passing, primability, stability, quality, matches)
+
+    def visualization(self, reverse: bool = False) -> Tuple[str, int, int]:
+        '''
+        Provide a decorated string representation of the primer.
+
+        Outputs the string and the left and right hand offset to the first base.
+        '''
+        trunc = self.trunc_mark if self.is_truncated else ''
+        if reverse:
+            return self.rev_3p_tick + Rev(self.seq) + trunc, len(self.rev_3p_tick), len(trunc)
+        else:
+            return trunc + self.seq + self.fwd_3p_tick, len(trunc), len(self.fwd_3p_tick)
+
+@dataclass
+class BindingResult():
+    primer : 'Primer'
+    binds: bool
+    primability: float
+    stability: float
+    quality: float
+    match_visual: str
+
+    reverse: bool = False
+    id : int = 0
+    pos : int = 0
+    template : 'Template' = None
+    
+@dataclass
+class Nmer():
+    seq: str
+    pos: int
+    rev_comp: bool
+    
+
+class Template():
+    seq:str
+    rc :str
+    length:int
+    is_circular: bool
+
+    def __init__(self, seq:str, is_circular : bool = False):
+        self.seq = seq.strip().upper()
+        self.rc = RevComp(seq)
+        self.length = len(self.seq)
+        self.is_circular = is_circular
+
+    def nmers(self, n, rev_comp : bool = False) -> 'Nmer':
+        for pos in range(1, len(self.seq)+1): 
+            nmer = Nmer(self.get_fixed_length_fragment(pos, n, rev_comp=rev_comp),
+                pos if not rev_comp else self.convert_rc_pos(pos), rev_comp )
+            yield nmer
+
+    def convert_rc_pos(self, rc_pos:int):
+        return len(self.seq) - rc_pos + 1
+
+    def get_fixed_length_fragment(self, start: int, n: int, pad : bool = True, rev_comp: bool = False) -> str:
+        """
+        Returns a fragment with length 'n' from the template starting at the 'start' position (1-indexed). 
+        Since the template is in 5' to 3', the sequencs starts from the start position and goes 'back' toward the 5'.
+        To access the 3' end, start should be the length of the sequence-1.
+        """
+        seq = self.seq if not rev_comp else self.rc
+
+        if start<n: # the 3' position is not far enough in to fit the whole nmer
+                
+            if self.is_circular: # reach back and get some sequence from the back end
+                nmer = seq[start-n:] + seq[0:start]
+            else: # just return a truncated sequence
+                nmer = (' '*(n-start) if pad else '') +seq[0:start]
+        elif start>self.length:
+            if self.is_circular: 
+                nmer = seq[start-n:] + seq[0:start-len(seq)]
+            else:
+                nmer = seq[start-n:] + (' '*(start-len(seq)) if pad else '')
         else: # just return a sequence of length n
-            nmer = seq[k-(n-1):k+1]
-        yield nmer, k
+            nmer = seq[start-n:start]
 
-# ---- Detection of PCR products ----
-class_order = ['good','okay','moderate','weak','very weak']
-def PCR(primers, template, circular=False, show_primer_binding=True, show_pdt_seq=True, silent=False):
-    
-    # print pre-amble
-    if not silent:
-        PrintHeader('Set up')
-        print("Conducting primer binding analysis followed by PCR analysis.")
-        print(f" - {len(primers)} primers supplied.")
-        print(f" - {'Linear' if not circular else 'Circular'} template ({len(template)} bp) supplied.")
-    
-    fwd, rev = [], []
-    for p in primers:
-        f, r = PrimerSearch(p, template, circular, show_primer_binding, silent)
-        fwd.extend(f)
-        rev.extend(r)
-    
-    pdt = []
-    for x in fwd:
-        fp = x['primer']
-        fpos = x['pos']
-        for y in rev:
-            rp = y['primer']
-            rpos = y['pos']
-            seq = ''
-            if fpos<rpos: # simple linear product within the frame of the template
-                seq = fp['seq'].lower()+template[fpos:rpos-1]+RevComp(rp['seq'].lower())
-            elif circular: # try to form a circular product assuming no strand displacement during PCR, meaning primers only amplify if they do not overlap. It is possible for partial overlaps to amplify, but it essentially requires recalculating the primer binding characteristics of the non-overlapping regions.
-                if (fpos-(len(fp['seq'])-1)) - (rpos+(len(rp['seq'])-1)) > 0: # no overlap between fwd and rev
-                    seq = fp['seq'].lower() + template[fpos:] + template[:rpos-1] + RevComp(rp['seq'].lower())
-            if seq!='':
-                # amplicon quality calculation and classification from Amplify 4
-                amplicon_q = len(seq)/(x['quality']*y['quality'])**2
-                q_desc = {'class':'very weak', 'desc':'very weak amplification — probably not visible on an agarose gel'}
-                if amplicon_q < 4000:
-                    q_desc = {'class':'weak', 'desc':'weak amplification — might be visible on an agarose gel'}
-                if amplicon_q < 1500:
-                    q_desc = {'class':'moderate', 'desc':'moderate amplification'}
-                if amplicon_q < 700:
-                    q_desc = {'class':'okay', 'desc':'okay amplification'}
-                if amplicon_q < 300:
-                    q_desc = {'class':'good', 'desc':'good amplification'}
+        return nmer
 
-                pdt.append({'id':len(pdt)+1, 'seq':seq, 'quality':amplicon_q, 'q_desc':q_desc, 'f_site':x, 'r_site':y})
-    
-    if not silent:
-        PrintHeader("PCR products")
-        if len(pdt) == 0:
-            print('No products detected.')
-        else:
-            class_count = {}
-            for p in pdt:
-                if p['q_desc']['class'] not in class_count:
-                    class_count[p['q_desc']['class']] = 0
-                class_count[p['q_desc']['class']] += 1
-            print(f"{len(pdt)} product{'s' if len(pdt)>1 else ''} detected:")    
-            print(' - '+','.join([f"{class_count[k]} {k}" for k in class_order if k in class_count]))
-            print(" - "+"For amplicons, primers are shown in lowercase, while the amplified insert is shown in uppercase.")
-        for p in pdt:
-            print('\n')
-            print(f"Pdt {p['id']} : {len(p['seq'])} bp | amplicon quality = {p['quality']:.0f} | {p['q_desc']['desc']}")
-            print(" - "+GetPrimerSiteAbbrev(p['f_site']))
-            print(" - "+GetPrimerSiteAbbrev(p['r_site']))
-            if show_pdt_seq:
-                print('')
-                print('Amplicon sequence:')
-                print()
-                print(p['seq'])
-        print('')
-    
-    return pdt
-    
-def test():
-    # 1. Test for primability, stability and quality calculations in comparison to Amplify
-    # the following are variants of the Pac-Bio fwd primers
-    seq1 = "GGTGACGTCAGGTGGCAC" # 1 with target1 | pr-0.89, st-0.56, q-0.31 with target1short
-    seq2 = "GGTGACGTCAGGAGGCAC" # pr-0.93, st-0.94, q-0.84 with target1
-    seq3 = "GGTGACTTCAGGAGGCAC" # pr-0.91, st-0.89, q-0.74 with target1
-    seq4 = "GGTGACTTCAGGAGGCAT" # pr-0.80, st-0.51, q-0.14 with target2
-    target1 = "GGTGACGTCAGGTGGCAC"
-    target1short = "CAGGTGGCAC"
-    target2 = "AAGAACATTTTGAGGCAT"
-    target = target1
-    pr = MakePrimer(seq2)
-    # print(pr)
-    
-    # print( PrimerStats(pr['seq'], target) )
-    
-    # print( Match(pr, target) )
-    # Testing notes:
-    #   Primability and stability calculations are generally successful. When rounded to 2 decimal places they match closely
-    #   to numbers observed in Amplify, but are not exact for unknown reasons; the most likely candidate is Amplify's use of
-    #   integers instead of floats for some calculations. The current program produces numbers that are
-    #   a tiny bit higher than Amplify. Additionally, since the quality scores are based on primability and stability, it also
-    #   tends to be a bit higher. Overall, this is enough to show that the program behaves the same way. An exact match is not
-    #   required so long as this program is calculating cut-offs for primer binding properly, and the small differences are not
-    #   expected to change the results significantly.
-    
-    # 2. Test for splitting a template into primer-length segments
-    # for nmer, k in Nmer(target1, 5, False):
-        # print(nmer, k)
-    # seems to work just fine
+    def same_as(self, other:'Template'):
+        return self.seq == other.seq and self.is_circular == other.is_circular
+
+class PCR_Manager():
+
+    def test_primer_cross_dimer(primer1:Primer, primer2:Primer):
+        '''
+        Takes two primers and checks if there are any stable dimerization sites between them.
+        To check self-dimers, just supply the same primer twice.
+        '''
         
-    # 3. Use a full sequence to search for primer binding sites in both linear and circular mode.
-    template = "TCGCTTAGCGGGCGGCCACCGGCTGGCTCGCTTCGCTCGGCCCGTGGACAACCCTGCTGGACAAGCTGATGGACAGGCTGCGCCTGCCCACGAGCTTGACCACAGGGATTGCCCACCGGCTACCCAGCCTTCGACCACATACCCACCGGCTCCAACTGCGCGGCCTGCGGCCTTGCCCCATCAATTTTTTTAATTTTCTCTGGGGAAAAGCCTCCGGCCTGCGGCCTGCGCGCTTCGCTTGCCGGTTGGACACCAAGTGGAAGGCGGGTCAAGGCTCGCGCAGCGACCGCGCAGCGGCTTGGCCTTGACGCGCCTGGAACGACCCAAGCCTATGCGAGTGGGGGCAGTCGAAGGCGAAGCCCGCCCGCCTGCCCCCCGAGCCTCACGGCGGCGAGTGCGGGGGTTCCAAGGGGGCAGCGCCACCTTGGGCAAGGCCGAAGGCCGCGCAGTCGATCAACAAGCCCCGGAGGGGCCACTTTTTGCCGGAGGGGGAGCCGCGCCGAAGGCGTGGGGGAACCCCGCAGGGGTGCCCTTCTTTGGGCACCAAAGAACTAGATATAGGGCGAAATGCGAAAGACTTAAAAATCAACAACTTAAAAAAGGGGGGTACGCAACAGCTCATTGCGGCACCCCCCGCAATAGCTCATTGCGTAGGTTAAAGAAAATCTGTAATTGACTGCCACTTTTACGCAACGCATAATTGTTGTCGCGCTGCCGAAAAGTTGCAGCTGATTGCGCATGGTGCCGCAACCGTGCGGCACCCTACCGCATGGAGATAAGCATGGCCACGCAGTCCAGAGAAATCGGCATTCAAGCCAAGAACAAGCCCGGTCACTGGGTGCAAACGGAACGCAAAGCGCATGAGGCGTGGGCCGGGCTTATTGCGAGGAAACCCACGGCGGCAATGCTGCTGCATCACCTCGTGGCGCAGATGGGCCACCAGAACGCCGTGGTGGTCAGCCAGAAGACACTTTCCAAGCTCATCGGACGTTCTTTGCGGACGGTCCAATACGCAGTCAAGGACTTGGTGGCCGAGCGCTGGATCTCCGTCGTGAAGCTCAACGGCCCCGGCACCGTGTCGGCCTACGTGGTCAATGACCGCGTGGCGTGGGGCCAGCCCCGCGACCAGTTGCGCCTGTCGGTGTTCAGTGCCGCCGTGGTGGTTGATCACGACGACCAGGACGAATCGCTGTTGGGGCATGGCGACCTGCGCCGCATCCCGACCCTGTATCCGGGCGAGCAGCAACTACCGACCGGCCCCGGCGAGGAGCCGCCCAGCCAGCCCGGCATTCCGGGCATGGAACCAGACCTGCCAGCCTTGACCGAAACGGAGGAATGGGAACGGCGCGGGCAGCAGCGCCTGCCGATGCCCGATGAGCCGTGTTTTCTGGACGATGGCGAGCCGTTGGAGCCGCCGACACGGGTCACGCTGCCGCGCCGGTAGTACGTAAGAGGTTCCGCGGCCGCGATCGTAGAAATATCTATGATTATCTTGAAGAACGCAACCCTATAGCAGCTATTGAAATTGATGATTTAATTGAAGAAAAGACAGATTTAGTTGTTGATAATCGACTGATGGGGCGCACAGGCAGACAGAAAGATACTAGGGAGTTAGTGATACATCCGCATTATGTGGTTGTATATGACATCACTGATATAATACGGATACTCAGAGTGCTACACACATCGCAGGAGTGGTCATGACTTACTCATGTACTTTGGATTATTTAGTGTTATAAAATCCTGATTTATAAATTTTTTTTGTTAAAAAAGATAAAAGCCCCTTGCAATTGCTTGGGGCTTTACCGTAATTTATGGGGTACAGATCTTCGATACTGACATATCGGCAATCGAAAGCATTAAGGTTTGACGACCGCTAATGATTTCACCACAGGGGCTTAATGTACCTGTCTTAAATTCTAAGGTTTTAACTCGCTTTGTCAAGCATAGACCCCAAAAATTTAGCCAATGTCTGTAACTCAATCTGTCCATGTGTGGGTGATGAGGTACAGTGACGCTAGCACACATCGGAAAAACGCTATTACTAGGGGAACTGAACAGAGTAGCGGACGCAATGAGTAGTCATTTAATTGGCGGTTATGAGCGTGTTCAGGCGGTGCTATCAATCGTAATCATAACAGTGGCAGCTTGATACAGTGATGTCATCCCTGATGCGAAAGCGACCGACCGACGGTACATCGAATGGGAATACTTTAGGGTGATTTTTAAGAATCGCTCTAGGGTGAGTATTTCCCATTCAGCTCTGCTCCCTCCCTCTGGTACTTTAATCAAAAGCACTACTAAACATATGTTTTTAAATAAAAAATATTGATATAGAGATAATATTAGTAAGAATAATTAAACAATTGAATATAGATAAATCATTGTTAAATAAAGATTAATTATTAAAATGAATGTATACTTATATATAAATCAATGATTTAAAATATTTGATAAAGAAAACTTTTCAAAAAAAATATAATTGAGATTGTGTCATTTCGGTCAATTCTTAATATGTTCCACGCAAGTTTTAGCTATGGTGCTAAACAGAAATTTGCTGAAAAAGAACTTTTCACTGAACTGGTTAAAATGTAAGCAGCCTGAGAGCCGCCAAAAATTTTAAAAACAAACCGCCTTAATCATCTTCAAAAAATACCTCTAAAACCTCACCATTTGCGTTTTAAGACCCATATTTCATCCTGCCCTTATGTTCCCATGCTGATAGCTATAAAGTGTCTGTAATCGCTTCCTATGACGTTCTAGGCTGTTGATAACTTTTGGAACAACGCAAAATGTTAAAATCCGCGGCCGCAGTCAAAAGCCTCCGACCGGAGGCTTTTGACTTGAGGGGGATCCACGCGTTTACGCCCCGCCCTGCCACTCATCGCAGTACTGTTGTAATTCATTAAGCATTCTGCCGACATGGAAGCCATCACAAACGGCATGATGAACCTGAATCGCCAGCGGCATCAGCACCTTGTCGCCTTGCGTATAATATTTGCCCATTGTGAAAACGGGGGCGAAGAAGTTGTCCATATTGGCCACGTTTAAATCAAAACTGGTGAAACTCACCCAGGGATTGGCTGAGACGAAAAACATATTCTCAATAAACCCTTTAGGGAAATAGGCCAGGTTTTCACCGTAACACGCCACATCTTGCGAATATATGTGTAGAAACTGCCGGAAATCGTCGTGGTATTCACTCCAGAGCGATGAAAACGTTTCAGTTTGCTCATGGAAAACGGTGTAACAAGGGTGAACACTATCCCATATCACCAGCTCACCGTCTTTCATTGCCATACGGAACTCCGGATGAGCATTCATCAGGCGGGCAAGAATGTGAATAAAGGCCGGATAAAACTTGTGCTTATTTTTCTTTACGGTCTTTAAAAAGGCCGTAATATCCAGCTGAACGGTCTGGTTATAGGTACATTGAGCAACTGACTGAAATGCCTCAAAATGTTCTTTACGATGCCATTGGGATATATCAACGGTGGTATATCCAGTGATTTTTTTCTCCATTTTAGCTTCCTTAGCTCCTGAAAATCTCGATAACTCAAAAAATACGCCCGGTAGTGATCTTATTTCATTATGGTGAAAGTTGGAACCTCTTACGTAGGATCCTTCTGCTATGGAGGTCAGGTATGACTGGCAATTCCGGTGACGTCAGGTGGCACTTTTCGGGGAAATGTGCGCGGAACCCCTATTTGTTTATTTTTCTAAATACATTCAAATATGTATCCGCTCATGAGACAATAACCCTGATAAATGCTTCAATAATATTGAAAAAGGAAGCCCATGGGATTCAAACTTTTGAGTAAGTTATTGGTCTATTTGACCGCGTCTATCATGGCTATTGCGAGCCCGCTCGCTTTTTCCGTAGATTCTAGCGGAGAATATCCGACAGTCAGCGAAATTCCGGTCGGGGAGGTCCGGCTTTACCAGATTGCCGATGGTGTTTGGTCGCATATCGCAACGCAGTCGTTTGATGGCGCAGTCTACCCGTCCAATGGTCTCATTGTCCGTGATGGTGATGAGTTGCTTTTGATTGATACAGCGTGGGGTGCGAAAAACACAGCGGCACTTCTCGCGGAGATTGAGAAGCAAATTGGACTTCCTGTAACGCGTGCAGTCTCCACGCACTTTCATGACGACCGCGTCGGCGGCGTTGATGTCCTTCGGGCGGCTGGGGTGGCAACGTACGCATCACCGTCGACACGCCGGCTAGCCGAGGTAGAGGGGAACGAGATTCCCACGCACTCTCTTGAAGGACTTTCATCGAGCGGGGACGCAGTGCGCTTCGGTCCAGTAGAACTCTTCTATCCTGGTGCTGCGCATTCGACCGACAACTTAATTGTGTACGTCCCGTCTGCGAGTGTGCTCTATGGTGGTTGTGCGATTTATGAGTTGTCACGCACGTCTGCGGGGAACGTGGCCGATGCCGATCTGGCTGAATGGCCCACCTCCATTGAGCGGATTCAACAACACTACCCGGAAGCACAGTTCGTCATTCCGGGGCACGGCCTGCCGGGCGGTCTTGACTTGCTCAAGCACACAACGAATGTTGTAAAAGCGCACACAAATCGCTCAGTCGTTGAGTAACTCGAGAAGCTTGATATCATTCAGGACGAGCCTCAGACTCCAGCGTAACTGGACTGAAAACAAACTAAAGCGCCCTTGTGGCGCTTTAGTTTTAGTATGGACTGGAGGTATCGTC"
+        # supply the primer sequence as reverse complement allows both the primer binding test
+        # and the visualizer to work correctly with the minimal set of changes
+        as_template = Template(RevComp(primer2.raw_seq)) 
+
+        fwd = []
+        for nmer in as_template.nmers(len(primer1.seq)):
+            result = primer1.test_binding(nmer.seq)
+            
+            if(result.binds):
+                result.pos = nmer.pos
+                result.template = as_template
+                fwd.append(result)
+
+            # result.pos = nmer.pos
+            # result.template = as_template
+            # print(nmer)
+            # print(Visuals.formatted_binding_site(result))
+        return {'fwd':fwd}
+
+    def test_binding_on_template( primer:Primer, template:Template):
+        # forward search
+        fwd = []
+        id = 1
+        for nmer in template.nmers(len(primer.seq)):
+            result = primer.test_binding(nmer.seq)
+            if result.binds:
+                result.id = id
+                id += 1
+                result.pos = nmer.pos
+                result.template = template
+                fwd.append(result)
+
+        # reverse search
+        id = 1
+        rev = []
+        for nmer in template.nmers(len(primer.seq), rev_comp=True):
+            result = primer.test_binding(nmer.seq)
+            if result.binds:
+                result.id = id
+                id += 1
+                result.reverse = True
+                result.pos = nmer.pos
+                result.template = template
+                result.match_visual = result.match_visual[::-1] # reverse the match visual for primer display
+                rev.append(result)
+
+        return {'fwd':fwd, 'rev':rev}
     
-    fwd_seq_3 = "gcggccaccggctg" # landing pad fwd v3
-    test_fwd_3p = 'CGAGCGTCGCTTAGCG' # fwd hanging off the 3' end of the template
-    test_fwd_5p = 'GGACTGGAGGTATCGTC' # fwd right on the 5' end of the template
-    rev_seq_2 = "gcgagacgatacctccagtcc" # landing pad rev v2
-    test_rev = 'gcttactctacctccagtcc' # rev hanging off the 3' rev
-    test_rev_2 = 'tataaatgcttactctacctccagtcc' # rev hanging off the 3' rev but longer
-    test_rev_5p = 'GGTGGCCGCCCGCTAAGCGA' # rev right on the 5' end of the template
-    f_primer = MakePrimer(fwd_seq_3, 'landing pad fwd v3')
-    # f_primer = MakePrimer(test_fwd_5p, 'fwd 3\' overhang')
-    # f_primer = MakePrimer(test_fwd_3p, 'fwd 3\' overhang')
-    # r_primer = MakePrimer(rev_seq_2, 'landing pad rev v2')
-    # r_primer = MakePrimer(test_rev, 'rev 3\' overhang')
-    # r_primer = MakePrimer(test_rev_2, 'rev 3\' overhang')
-    r_primer = MakePrimer(test_rev_5p, 'rev 5\' end')
+    def predict_products( binding_site_dicts: List[Dict[str, List[BindingResult] ]]) -> List['PCR_Product']:
+        # collect all forward and reverse sites
+        all : Dict[str, List[BindingResult]] = {'fwd':[], 'rev':[]}
+        template : Template = None
+        for result_dict in binding_site_dicts:
+            for dir, sites in result_dict.items():
+                # sanity check
+                for site in sites:
+                    if not site.binds or site.primer is None or site.template is None:
+                        continue
+                    if template is None:
+                        template = site.template
+                    elif not template.same_as(site.template):
+                        raise Exception("Binding sites used to predict PCR products do not share the same template.")
+                    all[dir].append(site)
+        
+        pdt = []
+        for f in all['fwd']:
+            for r in all['rev']:
+                seq = ''
+                start = r.pos-1
+                length = 0
+                if f.pos<r.pos: # simple linear product within the frame of the template
+                    length = start - f.pos
+                elif template.is_circular:
+                    # print(f.pos, f.pos-(len(f.primer.seq)-1), r.pos, r.pos+(len(r.primer.seq)-1))
+                    if (f.pos-(len(f.primer.seq)-1)) - (r.pos+(len(r.primer.seq)-1)) > 0: # only get fragment if there is no overlap in primers
+                        length = template.length - (f.pos - start)
+                if length>0:
+                    seq = f.primer.raw_seq.lower()+template.get_fixed_length_fragment(start, length, pad=False)+RevComp(r.primer.raw_seq.lower())
+                if seq!='':
+                    # amplicon quality calculation and classification from Amplify 4
+                    amplicon_q = len(seq)/(f.quality*r.quality)**2
+                    q_desc = {'class':'very weak', 'desc':'very weak amplification — probably not visible on an agarose gel'}
+                    if amplicon_q < 4000:
+                        q_desc = {'class':'weak', 'desc':'weak amplification — might be visible on an agarose gel'}
+                    if amplicon_q < 1500:
+                        q_desc = {'class':'moderate', 'desc':'moderate amplification'}
+                    if amplicon_q < 700:
+                        q_desc = {'class':'okay', 'desc':'okay amplification'}
+                    if amplicon_q < 300:
+                        q_desc = {'class':'good', 'desc':'good amplification'}
+                    
+                    pdt.append( PCR_Product(seq, f, r, q_desc['class'], q_desc['desc'], len(seq)) )
+
+        return pdt
+
+    def PCR(primers: List[Primer], template: Template, show_DNA: bool = True, show_pdt: bool = True):
+        site_dicts = []
+        for primer in primers:
+            site_dicts.append(PCR_Manager.test_binding_on_template(primer, template))
+        
+        pdts = PCR_Manager.predict_products(site_dicts)
+
+        Visuals.print_divider()
+        print('Overview\n')
+        print(f"{len(primers)} primers supplied" )
+        for primer in primers:
+            print(f"   {primer.name} - {primer.raw_seq}")
+
+        print(f"{template.length} bp {'circular' if template.is_circular else 'linear'} template supplied")
+
+        print()
+        Visuals.print_divider()
+        print('Primer binding\n')
+        for site_dict in site_dicts:
+            Visuals.print_half_divider()
+            Visuals.print_primer_sites(site_dict, show_DNA=show_DNA)
+
+        print()
+        Visuals.print_divider()
+        print('Potential PCR products')
+        print(' - Products are not reported if the binding regions of the primers overlap (even just by 1 bp).')
+        if len(pdts) == 0:
+            print(' - No products detected')
+        else:
+            print(f' - {len(pdts)} potential products')
+            print(' - For amplicons, primers are shown in lowercase, while the amplified insert is shown in uppercase.')
+        for pdt in pdts:
+            print('')
+            print(pdt.visualization(show_pdt=show_pdt))
+        
+
+@dataclass
+class PCR_Product():
+    seq: str
+    f_site: BindingResult
+    r_site: BindingResult
+    q_class: str
+    q_desc : str
+    length : int
+
+    def visualization(self, show_pdt: bool = True):
+        header = f"Product from {self.f_site.pos} to {self.r_site.pos} ({self.length} bp)"
+        p_fwd = f"   {self.f_site.primer.name} - fwd #{self.f_site.id}"
+        p_rev = f"   {self.r_site.primer.name} - rev #{self.r_site.id}"
+        pdt = self.seq if show_pdt else ''
+
+        return f"{header}\n{p_fwd}\n{p_rev}\n{pdt}"
+
+class Visuals():
+
+    width : int = 80
+    name_trunc_mark : str = '..'
+
+    def print_primer_sites(sites_dict: Dict[str, BindingResult], show_DNA:bool = True):
+        for _, sites in sites_dict.items():
+            for site in sites:
+                print(Visuals.formatted_binding_site(site, show_DNA=show_DNA))
+                print('')
+
+    def formatted_binding_site(site: BindingResult, show_DNA:bool = True):
+        width = Visuals.width
+        name = f"{site.primer.name}"
+        dir = f" - {'rev' if site.reverse else 'fwd'} #{site.id if site.id>0 else ''}, pos:{site.pos}"
+        stats = f"  P:{site.primability:.2f} S:{site.stability:.2f} Q:{site.quality:.2f}"
+        if (len(name+dir+stats) > width):
+            name_alloc = width - len(Visuals.name_trunc_mark+dir+stats)
+            name = name[:name_alloc] + Visuals.name_trunc_mark
+        space = width - len(name+dir+stats)
+        bind = Visuals.binding_visual(site) if show_DNA else ''
+        return f"{name}{dir}{' '*space}{stats}\n{bind}"
     
-    # fwd, rev = PrimerSearch(f_primer, template, circular=True)
-    # fwd, rev = PrimerSearch(f_primer, template, circular=False)
-      
-    # fwd, rev = PrimerSearch(r_primer, template, circular=True)
-    # fwd, rev = PrimerSearch(r_primer, template, circular=False)
+    def binding_visual( result: BindingResult):
+        if result.primer is None or result.template is None:
+            return
+
+        width = Visuals.width
+        mid = width//2
+        p_vis_raw, p_off_left, p_off_right = result.primer.visualization(result.reverse)
+        p_lead = mid - len(p_vis_raw)//2 # amount of space to add before primer
+        m_lead = p_lead + p_off_left # amount of space to add before match indicators
+        p_vis = ' ' * p_lead + p_vis_raw
+        m_vis = ' ' * m_lead + (result.match_visual)
+
+        t_offset = (width - m_lead - 1 if result.reverse else width - (p_lead + (len(p_vis_raw)-p_off_right)))
+        t_pos = result.pos + t_offset
+        # get a slice of the template, both forms of visualization actually use the forward direction
+        # rather, the primer gets reversed based on circumstance
+        t_vis = result.template.get_fixed_length_fragment( t_pos, width )
+        if result.reverse: # reverse display, template at top
+            return f'{t_vis}\n{m_vis}\n{p_vis}'
+        else: # forward display, template at bottom and complemented
+            t_vis = Comp(t_vis)
+            return f'{p_vis}\n{m_vis}\n{t_vis}'
+
+    def print_divider(char:str='-'):
+        print(char * Visuals.width)
+
+    def print_half_divider(char:str='-'):
+        print(char * (Visuals.width//3))
+
+def test():
+    pr = Primer("ATCGGCGGGGAAGAGAG")
+    pr.test_primer_stats("ATGCGCGATATGGACG")
+
+    fwd = Primer("CTGATAAATGCTTCAATAATATTGAAAAAG", "prom fwd")
+    rev = Primer("ATTGGCGGCGAAAGTCAGGCTGTG", "ndm del rev2")
+
+    tmp = Template("TTAAGGAGCAAAAGGCCAGCAAAAGGCCAGGAACCGTAAAAAGGCCGCGTTGCTGGCGTTTTTCCATAGGCTCCGCCCCCCTGACGAGCATCACAAAAATCGACGCTCAAGTCAGAGGTGGCGAAACCCGACAGGACTATAAAGATACCAGGCGTTTCCCCCTGGAAGCTCCCTCGTGCGCTCTCCTGTTCCGACCCTGCCGCTTACCGGATACCTGTCCGCCTTTCTCCCTTCGGGAAGCGTGGCGCTTTCTCATAGCTCACGCTGTAGGTATCTCAGTTCGGTGTAGGTCGTTCGCTCCAAGCTGGGCTGTGTGCACGAACCCCCCGTTCAGCCCGACCGCTGCGCCTTATCCGGTAACTATCGTCTTGANNCCAACCCGGTAAGACACGACTTATCGCCACTGGCAGCAGCCACTGGTAACAGGATTAGCAGAGCGAGGTATGTAGGCGGTGCTACAGAGTTCTTGAAGTGGTGGCCTAACTACGGCTACACTAGAAGGACAGTATTTGGTATCTGCGCTCTGCTNNAGCCAGTTACCTTCGGAAAAAGAGTTGGTAGCTCTTGATCCGGCAAACAAACCACCGCTGGTAGCGGTGGTTTTTTTGTTTGCAAGCAGCAGATTACGCGCAGAAAAAAAGGATCTCAAGAAGATCCTTTGATCTTTTCTACGGGGTCTGACGCTCAGTGGAACGAAAACTCACGTTAAGGGATTTTGGTCATGAGACTAGTTCGGCCTATTGGTTAAAAAATGAGCTGATTTAACAAAAATTTTAACAAAATTCAGAAGAACTCGTCAAGAAGGCGATAGAAGGCGATGCGCTGCGAATCGGGAGCGGCGATACCGTAAAGCACGAGGAAGCGGTCAGCCCATTCGCCGCCAAGCTCCTCGGCAATATCACGGGTAGCCAACGCTATGTCCTGATAGCGGTCCGCCACACCCAGCCGGCCACAGTCGATGAATCCAGAAAAGCGGCCATTTTCCACCATGATATTCGGCAAGCAGGCATCGCCGTGTGTCACGACGAGATCCTCGCCGTCGGGCATGCTCGCCTTGAGCCTGGCGAACAGTTCGGCTGGCGCGAGCCCCTGATGCACTTCGTCCAGATCATCCTGATCGACAAGACCGGCTTCCATCCGAGTACGTGCTCGCTCGATGCGATGTTTCGCTTGGTGGTCGAATGGGCAGGTAGCCGGATCAAGCGTATGCAGCCGCCGCATTGCATCAGCCATGATGGATACTTTCTCGGCAGGAGCAAGGTGAGATGACAGGAGATCCTGCCCCGGCACTTCGCCCAATAGCAGCCAGTCCCTTCCCGCCTCGGTGACAACGTCGAGCACAGCTGCGCAAGGAACGCCCGTCGTGGCCAGCCACGATAGCCGCGCTGCCTCGTCTTGCAGTTCATTCAGGGCACCGGACAGGTCGGTCTTGACAAAAAGAACCGGGCGCCCCTGCGCTGACAGCCGGAACACGGCGGCATCAGAGCAGCCGATTGTCTGTTGTGCCCAGTCATAGCCGAATAGCCTCTCCACCCAAGCGGCCGGAGAACCTGCGTGCAATCCATCTTGTTCAATCATGCGAAACGATCCTCATCCTGTCTCTTGATCAGAGCTTGATCCCCTGCGCCATCAGATCCTTGGCGGCGAGAAAGCCATCCAGTTTACTTTGCAGGGCTTCCCAACCTTACCAGAGGGCGCCCCAGCTGGCAATTCCGGTGACGTCAGGTGGCACTTTTCGGGGAAATGTGCGCGGAACCCCTATTTGTTTATTTTTCTAAATACATTCAAATATGTATCCGCTCATGAGACAATAACCCTGATAAATGCTTCAATAATATTGAAAAAGGAAGCCCATGGAATTGCCCAATATTATGCACCCGGTCGCGAAGCTGAGCACCGCATTAGCCGCTGCATTGATGCTGAGCGGGTGCATGCCCGGTGAAATCCGCCCGACGATTGGCCAGCAAATGGAAACTGGCGACCAACGGTTTGGCGATCTGGTTTTCCGCCAGCTCGCACCGAATGTCTGGCAGCACACTTCCTATCTCGACATGCCGGGTTTCGGGGCAGTCGCTTCCAACGGTTTGATCGTCAGAGATGGCGGTCGCGTGCTGGTGGTCGATACCGCCTGGACCGATGACCAGACCGCCCAGATCCTCAACTGGATCAAGCAGGAGATCAACCTGCCGGTCGCGCTGGCGGTGGTGACCCACGCGCATCAGGACAAGATGGGCGGTATGGACGCGCTGCATGCGGCGGGGATTGCGACTTATGCCAATGCGTTGTCGAACCAGCTTGCCCCGCAAGAGGGAATGGTTGCGGCGCAACACAGCCTGACTTTCGCCGCCAATGGCTGGGTCGAACCAGCAACCGCGCCCAACTTTGGCCCGCTCAAGGTATTTTACCCCGGCCCCGGCCACACCAGTGACAATATCACCGTTGGGATCGACGGCACCGACATCGCTTTTGGTGGCTGCCTGATCAAGGACAGCAAGGCCAAGTCGCTCGGCAATCTCGGTGATGCCGACACTGAGCACTACGCCGCGTCAGCGCGCGCGTTTGGTGCGGCGTTCCCCAAGGCCAGCATGATCGTGATGAGCCATTCCGCCCCCGATAGCCGCGCCGCAATCACTCATACGGCCCGCATGGCCGACAAGCTGCGCTGAAAGCTTGTCACCAAGTTTACTCATATATACTTTAGATTGATTTAAAACTTCATTTTTAATTTAAAAGGATCTAGGTGAAGATCCTTTTTC", is_circular=True)
+
+    f_bind = PCR_Manager.test_binding_on_template(fwd, tmp)
+    r_bind = PCR_Manager.test_binding_on_template(rev, tmp)
+
+    for primer in [f_bind, r_bind]:
+        Visuals.print_primer_sites(primer)
     
-    # Test result - Seems fine. Direction of binding is correct. For landing pad fwd v3, there seems to be a 
-    # binding site on the rev strand that Amplify does not detect, possibly because it is just over the threshold
-    # with rounding differences.
-    # Visualization of primer binding sites and the template context took a bit of trial and error, but all cases
-    # seem to behave as expected (linear vs circular template, and edge cases-right on the 3' or 5' of the template).
+    pdts = PCR_Manager.predict_products([f_bind, r_bind])
+    for pdt in pdts:
+        print(pdt.visualization())
+
+    # d_fwd = Primer("ATGGAATTGCCCAATATTATG", "dimer fwd", 10)
+    # d_rev = Primer("TCGCGACCGGGTGCATCATATT", "dimer rev", 10)
     
-    # 4. Use two primers and a template to simulate a PCR.
-    pcr_f = MakePrimer('TTCAAATATGTATCCGCTCATGAGACAAT','TEM-fwd')
-    pcr_frc = MakePrimer('ATTGTCTCATGAGCGGATACATATTTGAA','TEM-rev comp') # full overlap with TEM-fwd
-    pcr_frc2 = MakePrimer('GGATACATATTTGAATGTATTTAGA','TEM-rev partial') # partial overlap with TEM-fwd
-    pcr_fend = MakePrimer('TGTATTTAGAAAAATAAACAAATAG','TEM-rev end') # no-overlap but directly adjacent to with TEM-fwd
-    pcr_f3 = MakePrimer(fwd_seq_3, 'landing pad fwd v3') # no-overlap but directly adjacent to with TEM-fwd
-    pcr_r = MakePrimer(rev_seq_2,'landing pad rev 2')
-    pcr_r2 = MakePrimer('GGAACCTCTTACGTACTACC','pBTBX rev')
-    # PCR([pcr_f,pcr_r], template, circular=False) # standard PCR, no need for circularization, correct pdt seq and length
-    # PCR([pcr_f,pcr_r2], template, circular=True) # PCR crossing over circular boundary, correct pdt seq and length
-    # PCR([pcr_f,pcr_r2], template, circular=False) # PCR crossing over circular boundary, no amplification in linear mode
-    # PCR([pcr_f,pcr_frc], template, circular=False) # PCR with overlapping primers, no amplification in linear mode
-    # PCR([pcr_f,pcr_frc], template, circular=True) # PCR with overlapping primers, no amplification in circular mode
-    # PCR([pcr_f,pcr_frc2], template, circular=False) # PCR with partial overlapping primers, no amplification in linear mode
-    # PCR([pcr_f,pcr_frc2], template, circular=True) # PCR with partial overlapping primers, no amplification in circular mode
-    # PCR([pcr_f,pcr_fend], template, circular=True) # PCR directly adjacent primers, amplification in circular mode of entire plasmid
-    # PCR([pcr_f,pcr_fend], template, circular=False) # PCR directly adjacent primers, no amplification in linear mode
-    # PCR([pcr_f3,pcr_r], template, circular=True) # Test with multiple products to see output formatting
-    
-    
+    # self_bind = PCR_Manager.test_primer_cross_dimer(d_fwd, d_fwd)
+    # Visuals.print_primer_sites(self_bind)
+    # cross_bind = PCR_Manager.test_primer_cross_dimer(d_fwd, d_rev)
+    # Visuals.print_primer_sites(cross_bind)
+
+    # lin_temp = Template("TCAATAATATTGAAAAAGGAAGCCCATGGAATTGCCCAATATTATGCACCCGGTCGCGAAGCTGAGCACCGC")
+    # rev_lin_temp = Primer("ACCCGGTCGCGAAGCTGAGCACCGC","rev_lin_temp")
+    # rev_lin_over = Primer("AAGCTGAGCACCGCATTAG","rev_lin_over")
+    # Visuals.print_primer_sites(PCR_Manager.test_binding_on_template( fwd, lin_temp))
+    # Visuals.print_primer_sites(PCR_Manager.test_binding_on_template( rev_lin_temp, lin_temp))
+    # Visuals.print_primer_sites(PCR_Manager.test_binding_on_template( rev_lin_over, lin_temp))
+
+    # super_short_temp = Template("TCAATAATATTGAAAAAGGCAACCCTGATAAATGCT")#, is_circular=True)
+    # Visuals.print_primer_sites(PCR_Manager.test_binding_on_template( fwd, super_short_temp))
+
 if __name__ == "__main__":
     # test()
-    
+
     parser = argparse.ArgumentParser(description="Python implementation of the \'primer binding\' and \'PCR\' functions of Amplify 4. Supply a DNA sequence in plain text, and a tab-separated file with a list of primers. The primer list matches the format for Amplify 4, with the first column containing the primer sequence written in the 5\' to 3\' direction, the second column holds the primer names. Upon running this script, both the PCR binding and potential products are analysed and reported. By default, this script will only check each primer up to a length of 30bp from the 3\' end. This implementation does not assess primer Tm or dimerisation.")
     
     parser.add_argument('template_file', type=str, help='DNA template in plain text. Include only the DNA sequence, removing all headers, annotations or comments. By default, the template will be treated as linear. Use the \'-circular_template\' flag to specify a circular template.')
     parser.add_argument('primer_file', type=str, help = 'File containing primers, with 2 columns of data separated by a TAB character. The first column contains the primer sequence, and the second column contains the primer name. Primers need to have unique names.')
-    parser.add_argument('-primer_names', '-n', type=str, nargs='+', help = 'Choose one or more primers to analyse by name (second column in primer file). Enter names separated by spaces. If names contain spaces, use single quotes (i.e.\'primer name\') to isolate them .')
+    # parser.add_argument('-primer_names', '-n', type=str, nargs='+', help = 'Choose one or more primers to analyse by name (second column in primer file). Enter names separated by spaces. If names contain spaces, use single quotes (i.e.\'primer name\') to isolate them .')
     parser.add_argument('-primer_positions', '-p', type=int, nargs='+', help = 'Choose one or more primers to analyse by their position in the list (the row in the primer file). The 1st row has a position of 1.')
     
     parser.add_argument('-outfile', '-o', type=str, help='Filepath, if specified, output will be saved to this file instead of being printed on screen. WARNING: this will overwrite existing files!')
@@ -461,20 +536,17 @@ if __name__ == "__main__":
     parser.add_argument('-hide_pcr_product', '-hp', action='store_true', help='Flag. If set, the PCR product sequences will not be shown when reporting potentiol PCR products.')
     
     args = parser.parse_args()
-    # check required settings
-    use_name= False
-    if not args.primer_names and not args.primer_positions:
+
+    if not args.primer_positions:
         print("\nError: No primers specified.\n")
         quit()
-    elif args.primer_names: # use names
-        use_name = True
-        
-    # read template
+
+        # read template
     templist = []
     with open(args.template_file,'r') as f:
         for line in f:
             templist.append(line.strip())
-    template = ''.join(templist)
+    template = Template(''.join(templist), is_circular=args.circular_template )
     
     # read primers
     primer_list = []
@@ -484,39 +556,28 @@ if __name__ == "__main__":
             if line.strip()=='':
                 continue
             row = line.split('\t')
-            if use_name:
-                primer_names[row[1]] = row[0]
-            else:
-                primer_list.append(row)
+            
+            primer_list.append(row)
     
     primers = []
-    if use_name:
-        for name in args.primer_names:
-            if name in primer_names:
-                primers.append(MakePrimer(primer_names[name], name))
-            else:
-                print(f"\nError: No primers with the name \'{name}\' was found in the list of primers.\n")
-                quit()
-    else:
-        for pos in args.primer_positions:
-            i = pos-1
-            if i<len(primer_list):
-                primers.append(MakePrimer(primer_list[i][0], primer_list[i][1]))
-            else:
-                print(f"\nError: The position {pos} is outside the range of the primer list.\n")
-                quit()
-    
+    for pos in args.primer_positions:
+        i = pos-1
+        if i<len(primer_list):
+            primers.append(Primer( raw_seq=primer_list[i][0], name=primer_list[i][1].strip() ) )
+        else:
+            print(f"\nError: The position {pos} is outside the range of the primer list.\n")
+            quit()
+
     # redirect output to file if specified
     if args.outfile:
-        outfile = open(args.outfile,'w')
+        outfile = open(args.outfile,'w', encoding='utf-8')
         sys.stdout = outfile
         print("This file contains output from the program AmpliPy. Please view this file with a monospaced font (e.g., Consolas, Courier New, etc.) to preserve the correct output formatting.")
         
     # conduct primer binding and PCR
-    PCR(primers, template, args.circular_template, show_primer_binding=not args.hide_primer_binding, show_pdt_seq=not args.hide_pcr_product)
+    PCR_Manager.PCR(primers, template, show_DNA=not args.hide_primer_binding, show_pdt=not args.hide_pcr_product)
     
     # close file if needed
     if args.outfile:
         sys.stdout = sys.__stdout__
         outfile.close()
-        
