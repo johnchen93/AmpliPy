@@ -1,9 +1,9 @@
 # AmpliPy
 by John Chen  
 # Overview
-AmpliPy is a Python implementation of the primer binding and PCR analysis methods of Amplify 4 (https://github.com/wrengels/Amplify4). Given one or more primers and a DNA template, the program conducts a search for possible binding sites for each primer to the template, then tests the binding sites for formation of amplicons. AmpliPy does not implement the primer Tm or dimerization calculations features from Amplify 4.  
+AmpliPy is a Python implementation of the primer binding and PCR analysis methods of Amplify 4 (https://github.com/wrengels/Amplify4). Given one or more primers and a DNA template, the program conducts a search for possible binding sites for each primer to the template, then tests the binding sites for formation of amplicons. AmpliPy does not implement the primer Tm or dimerization calculations features from Amplify 4. The PCR products are simply a list of possibilities given a set of primer binding sites. AmpliPy does not conduct actual PCR simulations.  
   
-The calculation of primer binding follows the primability and stability measures stated in the Amplify 4 help menu. AmpliPy’s calculations tend to be a bit higher than Amplify 4’s numbers, possibly due to differences in rounding between the two implementations.  
+The calculation of primer binding follows the primability and stability measures stated in the Amplify 4 help menu. In simple terms, the method checks how well the 3’ end of a primer matches any potential binding sites in the template. AmpliPy’s calculations tend to be a bit higher than Amplify 4’s numbers, possibly due to differences in rounding between the two implementations.  
   
 A PDF version of this README is available [here](./AmpliPy.pdf).  
 # Usage  
@@ -32,20 +32,43 @@ python   amplipy.py   example_template.txt   example_primers.txt   -p   1   3   
 ## Running from another Python script
 To conduct the analysis from another script, import the ‘MakePrimer’ and ‘PCR’ functions from AmpliPy. See ‘import_example.py’ for a full example.  
 ```python
-from amplipy import MakePrimer, PCR, PrimerSearch
+from amplipy import Primer, Template, PCR_Manager, Visuals
 
-f_primer = MakePrimer("TTCAAATATGTATCCGCTCATGAGACAAT","TEM1-fwd")
-r_primer = MakePrimer("CCTTTTGCTGGCCTTTTGCTCC","B1")
+# define the template
+template_seq = "TTAAGGAGCAAAAGGCCAGCAAAAGGCCAGGAACCGTAAAAAGGCCGCGTTGCTGGCGTTTTTCCATAGGCTCCGCCCCCCTGACGAGCATCACAAAAATCGACGCTCAAGTCAGAGGTGGCGAAACCCGACAGGACTATAAAGATACCAGGCGTTTCCCCCTGGAAGCTCCCTCGTGCGCTCTCCTGTTCCGACCCTGCCGCTTACCGGATACCTGTCCGCCTTTCTCCCTTCGGGAAGCGTGGCGCTTTCTCATAGCTCACGCTGTAGGTATCTCAGTTCGGTGTAGGTCGTTCGCTCCAAGCTGGGCTGTGTGCACGAACCCCCCGTTCAGCCCGACCGCTGCGCCTTATCCGGTAACTATCGTCTTGANNCCAACCCGGTAAGACACGACTTATCGCCACTGGCAGCAGCCACTGGTAACAGGATTAGCAGAGCGAGGTATGTAGGCGGTGCTACAGAGTTCTTGAAGTGGTGGCCTAACTACGGCTACACTAGAAGGACAGTATTTGGTATCTGCGCTCTGCTNNAGCCAGTTACCTTCGGAAAAAGAGTTGGTAGCTCTTGATCCGGCAAACAAACCACCGCTGGTAGCGGTGGTTTTTTTGTTTGCAAGCAGCAGATTACGCGCAGAAAAAAAGGATCTCAAGAAGATCCTTTGATCTTTTCTACGGGGTCTGACGCTCAGTGGAACGAAAACTCACGTTAAGGGATTTTGGTCATGAGACTAGTTCGGCCTATTGGTTAAAAAATGAGCTGATTTAACAAAAATTTTAACAAAATTCACGCCCCGCCCTGCCACTCATCGCAGTACTGTTGTAATTCATTAAGCATTCTGCCGACATGGAAGCCATCACAAACGGCATGATGAACCTGAATCGCCAGCGGCATCAGCACCTTGTCGCCTTGCGTATAATATTTGCCCATAGTGAAAACGGGGGCGAAGAAGTTGTCCATATTGGCCACGTTTAAATCAAAACTGGTGAAACTCACCCAGGGATTGGCTGAGACGAAAAACATATTCTCAATAAACCCTTTAGGGAAATAGGCCAGGTTTTCACCGTAACACGCCACATCTTGCGAATATATGTGTAGAAACTGCCGGAAATCGTCGTGGTATTCACTCCAGAGCGATGAAAACGTTTCAGTTTGCTCATGGAAAACGGTGTAACAAGGGTGAACACTATCCCATATCACCAGCTCACCGTCTTTCATTGCCATACGTAATTCCGGATGAGCATTCATCAGGCGGGCAAGAATGTGAATAAAGGCCGGATAAAACTTGTGCTTATTTTTCTTTACGGTCTTTAAAAAGGCCGTAATATCCAGCTGAACGGTCTGGTTATAGGTACATTGAGCAACTGACTGAAATGCCTCAAAATGTTCTTTACGATGCCATTGGGATATATCAACGGTGGTATATCCAGTGATTTTTTTCTCCATGCGAAACGATCCTCATCCTGTCTCTTGATCAGAGCTTGATCCCCTGCGCCATCAGATCCTTGGCGGCGAGAAAGCCATCCAGTTTACTTTGCAGGGCTTCCCAACCTTACCAGAGGGCGCCCCAGCTGGCAATTCCGGTGACGTCAGGTGGCACTTTTCGGGGAAATGTGCGCGGAACCCCTATTTGTTTATTTTTCTAAATACATTCAAATATGTATCCGCTCATGAGACAATAACCCTGATAAATGCTTCAATAATATTGAAAAAGGAAGCCCATGGGATTCAAACTTTTGAGTAAGTTATTGGTCTATTTGACCGCGTCTATCATGGCTATTGCGAGCCCGCTCGCTTTTTCCGTAGATTCTAGCGGAGAATATCCGACAGTCAGCGAAATTCCGGTCGGGGAGGTCCGGCTTTACCAGATTGCCGATGGTGTTTGGTCGCATATCGCAACGCAGTCGTTTGATGGCGCAGTCTACCCGTCCAATGGTCTCATTGTCCGTGATGGTGATGAGTTGCTTTTGATTGATACAGCGTGGGGTGCGAAAAACACAGCGGCACTTCTCGCGGAGATTGAGAAGCAAATTGGACTTCCTGTAACGCGTGCAGTCTCCACGCACTTTCATGACGACCGCGTCGGCGGCGTTGATGTCCTTCGGGCGGCTGGGGTGGCAACGTACGCATCACCGTCGACACGCCGGCTAGCCGAGGTAGAGGGGAACGAGATTCCCACGCACTCTCTTGAAGGACTTTCATCGAGCGGGGACGCAGTGCGCTTCGGTCCAGTAGAACTCTTCTATCCTGGTGCTGCGCATTCGACCGACAACTTAATTGTGTACGTCCCGTCTGCGAGTGTGCTCTATGGTGGTTGTGCGATTTATGAGTTGTCACGCACGTCTGCGGGGAACGTGGCCGATGCCGATCTGGCTGAATGGCCCACCTCCATTGAGCGGATTCAACAACACTACCCGGAAGCACAGTTCGTCATTCCGGGGCACGGCCTGCCGGGCGGTCTTGACTTGCTCAAGCACACAACGAATGTTGTAAAAGCGCACACAAATCGCTCAGTCGTTGAGTAACTCGAGAAGCTTGTCACCAAGTTTACTCATATATACTTTAGATTGATTTAAAACTTCATTTTTAATTTAAAAGGATCTAGGTGAAGATCCTTTTTC"
+template = Template(template_seq, is_circular=True)
 
-fwd, rev = PrimerSearch(f_primer, template, circular=True, silent=True)
-pdt = PCR([f_primer, r_primer],template, circular=True, silent=True)
+# define primers
+primer1 = Primer("TTCAAATATGTATCCGCTCATGAGACAAT", "TEM1-fwd")
+primer2 = Primer("CCTTTTGCTGGCCTTTTGCTCC", "B1")
+
+
+# to check just for binding sites
+primer1_binding_sites = PCR_Manager.test_binding_on_template(primer1, template)
+primer2_binding_sites = PCR_Manager.test_binding_on_template(primer2, template)
+
+# show the parameters available in the data output
+print(primer1_binding_sites)
+print(primer1_binding_sites['fwd'][0]) # each primer is in a BindingResult dataclass
+# use the Visuals class to print formatted binding sites
+Visuals.print_primer_sites(primer1_binding_sites)
+
+# to check for potential products when given a list of all binding sites
+pdt_list = PCR_Manager.predict_products([primer1_binding_sites, primer2_binding_sites])
+for pdt in pdt_list:
+    print(pdt.visualization())
+
+
+# To conduct the whole process and print the results in one command
+PCR_Manager.PCR( [primer1, primer2], template, show_DNA=True, show_pdt=True )
 ```
-MakePrimer() takes a DNA sequence and optionally a label to create a primer object. Lists of one or more primer objects can then be fed to the PCR() function as the first argument, followed by the template DNA and a boolean indicating whether the template is circular.  
-  
-The output of PCR() is a list of potential PCR products, each represented by a dictionary that includes their sequence (under the key ‘seq’), the amplicon quality (quality), the description of the PCR strength (q_desc) and the primer binding sites that generated the product (f_site and r_site).  
-  
-Each primer binding site is also a dictionary containing information on the binding site, including the position of the 3’ end (pos), the primer binding stats (primability, stability and quality), the direction of binding relative to the template (dir) and the information on the binding context which can be printed for visualization (binding).  
-  
-To search for primer binding sites without testing PCR products, the user can make direct use of the PrimerSearch() function by providing the primer object, the template and a boolean on the circularity of the template as arguments. The outputs are the primer binding sites in the fwd and rev direction, in the same output format as stated above.  
-  
-By default, PrimerSearch() and PCR() will still print their output. To suppress this behavior, set the optional ‘silent’ argument to True.  
+_Primer()_ takes a DNA sequence and optionally a label to create a primer object. Similarly, _Template()_ takes a sequence and creates a template, with an optional ‘_is_circular_’ parameter; templates are treated as linear by default.  
+
+Lists of one or more Primer objects can then be fed to the _PCR_Manager. test_binding_on_template()_ function as the first argument, followed by the template.
+The output of _PCR_Manager. test_binding_on_template()_ is a dictionary of potential forward (key = ‘fwd’) and reverse (key = ‘rev’) primer binding sites, each represented by a ‘_BindingResult_’ object. The binding site dictionary can be visualized using the _Visuals.print_primer_sites()_ function. Each _BindingResult_ contains information, including the position of the 3’ end (pos), the primer binding stats (primability, stability and quality), whether the direction of binding is reversed relative to the template (reverse).  
+
+A list of binding site dictionaries can be supplied to the _PCR_Manager.predict_products()_ function to check for potential PCR products. The sites need to share the same template. Each product is represented by a _PCR_Product_ object that includes their sequence (under the key ‘seq’) and the primer binding sites that generated the product (f_site and r_site).  
+
+Use the _PCR_Manager.PCR()_ function to simultaneously conduct a search of potential primer binding sites on a template and list possible products. The output is directly printed to the terminal.  
+
+
