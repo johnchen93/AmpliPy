@@ -5,6 +5,8 @@ AmpliPy is a Python implementation of the primer binding and PCR analysis method
   
 The calculation of primer binding follows the primability and stability measures stated in the Amplify 4 help menu. In simple terms, the method checks how well the 3’ end of a primer matches any potential binding sites in the template. AmpliPy’s calculations tend to be a bit higher than Amplify 4’s numbers, possibly due to differences in rounding between the two implementations.  
   
+A javascript implementation is also accessible as a webtool [here](https://jsamplify.web.app/).  
+  
 A PDF version of this README is available [here](./AmpliPy.pdf).  
 # Usage  
 ## Installation  
